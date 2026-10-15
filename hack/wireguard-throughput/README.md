@@ -152,7 +152,9 @@ and asset IDs, archive checksums and platform manifest digests checked in.
 Both complete OCI layouts, payload hashes and source labels are verified before
 the first registry write. Skopeo preserves the manifests and publishes by
 digest to `ghcr.io/noeljackson/kernel` and `ghcr.io/noeljackson/drbd-pkg`.
-The workflow uses its repository-scoped ephemeral token; it does not export
+GitHub requires repository push access to read drafts, so this bounded job has
+`contents: write` as well as `packages: write`; its transfer code only reads the
+identified draft and assets. The workflow uses its repository-scoped ephemeral token; it does not export
 an owner's GitHub CLI token or require a new personal credential.
 
 Publication success checks registry manifest bytes but does not prove public

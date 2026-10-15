@@ -17,7 +17,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
-      contents: read
+      # GitHub requires push access even to read a private draft release.
+      contents: write
       packages: write
     steps:
       - name: Select a transient registry configuration
