@@ -19,9 +19,9 @@ jobs:
     permissions:
       contents: read
       packages: write
-    env:
-      DOCKER_CONFIG: ${{ runner.temp }}/wireguard-publisher-docker
     steps:
+      - name: Select a transient registry configuration
+        run: echo "DOCKER_CONFIG=$RUNNER_TEMP/wireguard-publisher-docker" >> "$GITHUB_ENV"
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
