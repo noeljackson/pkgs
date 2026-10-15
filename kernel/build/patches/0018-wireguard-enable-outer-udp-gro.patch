@@ -1,0 +1,23 @@
+Subject: [PATCH] wireguard: request outer UDP GRO before tunnel segmentation
+
+Set GRO_ENABLED only on WireGuard-owned sockets. Standard UDP receive
+still segments the aggregate before encap_rcv because WireGuard does not
+accept UDP L4 GSO records. This amortizes the outer ingress stack while
+preserving per-record authentication and ordering. No NIC-wide fraglist
+setting changes.
+
+---
+diff --git a/drivers/net/wireguard/socket.c b/drivers/net/wireguard/socket.c
+--- a/drivers/net/wireguard/socket.c
++++ b/drivers/net/wireguard/socket.c
+@@ -343,6 +343,10 @@
+ {
+ 	sock->sk->sk_allocation = GFP_ATOMIC;
+ 	sock->sk->sk_sndbuf = INT_MAX;
++	/* Aggregate outer UDP through GRO. The UDP tunnel receive path still
++	 * segments before invoking encap_rcv, so WireGuard receives one record.
++	 */
++	udp_set_bit(GRO_ENABLED, sock->sk);
+ 	sk_set_memalloc(sock->sk);
+ }
+ 

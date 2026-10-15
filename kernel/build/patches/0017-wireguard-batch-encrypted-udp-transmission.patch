@@ -1,0 +1,110 @@
+Subject: [PATCH] wireguard: batch encrypted datagrams using UDP GSO
+
+The per-peer ordered transmit worker sends every encrypted segment
+through outer routing, netfilter, TC and the NIC individually. On the
+AMS/FRA Talos nodes this is a measured serial CPU bottleneck, separate
+from crypto workers and the single-flow receive path.
+
+Combine bounded runs of equal-sized ciphertext records with equal DS and
+flow-hash metadata into UDP GSO skbs. Each record retains its original
+header, nonce and tag. Keepalives and short/ineligible runs use the old
+path; allocation or copy failure leaves the original list intact. The
+existing socket, route, policy and device paths process the resulting
+skb normally.
+
+Require equal flow hashes and hash flags to preserve the existing
+transmit queue selection inputs. Focused debug selftests cover this
+boundary, complete record bytes, GSO/checksum metadata, keepalives and
+segment/byte bounds. See the downstream test report for source-level
+results and the required signed-kernel/DRBD/Talos acceptance chain; this
+is not production acceptance.
+
+---
+diff --git a/drivers/net/wireguard/send.c b/drivers/net/wireguard/send.c
+--- a/drivers/net/wireguard/send.c
++++ b/drivers/net/wireguard/send.c
+@@ -239,17 +239,80 @@
+ 	wg_packet_send_staged_packets(peer);
+ }
+ 
++/*
++ * Coalesce an already-encrypted run into an ordinary UDP GSO packet.
++ * Each segment retains its complete WireGuard header, nonce and tag. Allocation
++ * or copy failure leaves the original list intact for the existing send path.
++ * Equal flow hashes preserve the existing transmit-queue selection inputs.
++ */
++static struct sk_buff *wg_packet_udp_batch(struct sk_buff *first,
++					   struct sk_buff **after)
++{
++	struct sk_buff *skb, *end, *next, *batch;
++	unsigned int size = first->len, count = 0, len = 0;
++	u8 ds = PACKET_CB(first)->ds;
++
++	if (size <= message_data_len(0))
++		return NULL;
++	for (end = first; end && count < 32; end = end->next) {
++		if (end->len != size || PACKET_CB(end)->ds != ds ||
++		    end->hash != first->hash ||
++		    end->l4_hash != first->l4_hash ||
++		    end->sw_hash != first->sw_hash ||
++		    len + size > 65535 - sizeof(struct ipv6hdr) - sizeof(struct udphdr))
++			break;
++		len += size;
++		++count;
++	}
++	if (count < 2)
++		return NULL;
++	batch = alloc_skb(DATA_PACKET_HEAD_ROOM + len, GFP_ATOMIC | __GFP_NOWARN);
++	if (!batch)
++		return NULL;
++	skb_reserve(batch, DATA_PACKET_HEAD_ROOM);
++	for (skb = first; skb != end; skb = skb->next) {
++		if (unlikely(skb_copy_bits(skb, 0, skb_put(batch, size), size))) {
++			kfree_skb(batch);
++			return NULL;
++		}
++	}
++	batch->hash = first->hash;
++	batch->l4_hash = first->l4_hash;
++	batch->sw_hash = first->sw_hash;
++	skb_reset_network_header(batch);
++	skb_reset_inner_headers(batch);
++	skb_shinfo(batch)->gso_type = SKB_GSO_UDP_L4;
++	skb_shinfo(batch)->gso_size = size;
++	skb_shinfo(batch)->gso_segs = count;
++	batch->ip_summed = CHECKSUM_PARTIAL;
++	/* The socket path pushes the UDP header immediately before this data. */
++	batch->csum_start = skb_headroom(batch) - sizeof(struct udphdr);
++	batch->csum_offset = offsetof(struct udphdr, check);
++	*after = end;
++	for (skb = first; skb != end; skb = next) {
++		next = skb->next;
++		skb_mark_not_on_list(skb);
++		consume_skb(skb);
++	}
++	return batch;
++}
++
+ static void wg_packet_create_data_done(struct wg_peer *peer, struct sk_buff *first)
+ {
+-	struct sk_buff *skb, *next;
++	struct sk_buff *skb, *next, *batch;
+ 	bool is_keepalive, data_sent = false;
++	u8 ds;
+ 
+ 	wg_timers_any_authenticated_packet_traversal(peer);
+ 	wg_timers_any_authenticated_packet_sent(peer);
+-	skb_list_walk_safe(first, skb, next) {
++	for (skb = first; skb; skb = next) {
++		ds = PACKET_CB(skb)->ds;
++		next = skb->next;
++		batch = wg_packet_udp_batch(skb, &next);
++		if (batch)
++			skb = batch;
+ 		is_keepalive = skb->len == message_data_len(0);
+-		if (likely(!wg_socket_send_skb_to_peer(peer, skb,
+-				PACKET_CB(skb)->ds) && !is_keepalive))
++		if (likely(!wg_socket_send_skb_to_peer(peer, skb, ds) && !is_keepalive))
+ 			data_sent = true;
+ 	}
+ 

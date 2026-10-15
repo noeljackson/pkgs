@@ -1,0 +1,152 @@
+Subject: [PATCH] wireguard: test encrypted UDP batch boundaries
+
+Exercise the real batching helper through the existing DEBUG-only module
+selftest admission. Check complete record bytes, GSO/checksum metadata,
+flow-hash affinity, DS/ECN, record lengths, isolated packets,
+keepalives, segment and byte bounds, and the retained tail after a
+partial batch.
+
+The four hash-affinity cases reject the initial batching draft.
+Production builds without WIREGUARD_DEBUG do not include these tests.
+
+---
+diff --git a/drivers/net/wireguard/main.c b/drivers/net/wireguard/main.c
+--- a/drivers/net/wireguard/main.c
++++ b/drivers/net/wireguard/main.c
+@@ -28,7 +28,7 @@
+ #ifdef DEBUG
+ 	ret = -ENOTRECOVERABLE;
+ 	if (!wg_allowedips_selftest() || !wg_packet_counter_selftest() ||
+-	    !wg_ratelimiter_selftest())
++	    !wg_ratelimiter_selftest() || !wg_packet_batch_selftest())
+ 		goto err_peer;
+ #endif
+ 	wg_noise_init();
+diff --git a/drivers/net/wireguard/queueing.h b/drivers/net/wireguard/queueing.h
+--- a/drivers/net/wireguard/queueing.h
++++ b/drivers/net/wireguard/queueing.h
+@@ -212,6 +212,7 @@
+ 
+ #ifdef DEBUG
+ bool wg_packet_counter_selftest(void);
++bool wg_packet_batch_selftest(void);
+ #endif
+ 
+ #endif /* _WG_QUEUEING_H */
+diff --git a/drivers/net/wireguard/send.c b/drivers/net/wireguard/send.c
+--- a/drivers/net/wireguard/send.c
++++ b/drivers/net/wireguard/send.c
+@@ -475,3 +475,5 @@
+ 	 */
+ 	wg_packet_send_queued_handshake_initiation(peer, false);
+ }
++
++#include "selftest/batch.c"
+diff --git a/drivers/net/wireguard/selftest/batch.c b/drivers/net/wireguard/selftest/batch.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/net/wireguard/selftest/batch.c
+@@ -0,0 +1,103 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#ifdef DEBUG
++bool __init wg_packet_batch_selftest(void)
++{
++	static const struct {
++		unsigned int count, size, change, expected;
++	} cases[] = {
++		{ 2, 64, 0, 2 }, /* Complete equal records. */
++		{ 2, 64, 1, 0 }, /* Different flow hash. */
++		{ 2, 64, 2, 0 }, /* Different L4 hash flag. */
++		{ 2, 64, 3, 0 }, /* Different software hash flag. */
++		{ 2, 64, 4, 0 }, /* Different DS/ECN. */
++		{ 2, 64, 5, 0 }, /* Different record length. */
++		{ 1, 64, 0, 0 }, /* Isolated record. */
++		{ 2, 32, 0, 0 }, /* Keepalives. */
++		{ 33, 64, 0, 32 }, /* Segment-count bound. */
++		{ 2, 32744, 0, 0 }, /* IPv6/UDP length bound. */
++		{ 3, 64, 6, 2 } /* Preserve the next flow after a batch. */
++	};
++	struct sk_buff *first, *skb, *tail, *batch, *after, *expected_after;
++	unsigned int test, i, j, size;
++	bool success = true, ok;
++
++	for (test = 0; test < ARRAY_SIZE(cases); ++test) {
++		first = NULL;
++		tail = NULL;
++		expected_after = NULL;
++		for (i = 0; i < cases[test].count; ++i) {
++			size = cases[test].size;
++			if (cases[test].change == 5 && i == 1)
++				--size;
++			skb = alloc_skb(size, GFP_KERNEL);
++			if (!skb) {
++				kfree_skb_list(first);
++				pr_err("UDP batch self-test allocation: FAIL\n");
++				return false;
++			}
++			memset(skb_put(skb, size), i + 1, size);
++			skb->hash = 42;
++			skb->l4_hash = 1;
++			skb->sw_hash = 1;
++			PACKET_CB(skb)->ds = 0;
++			if (i == 1) {
++				switch (cases[test].change) {
++				case 1:
++					skb->hash = 43;
++					break;
++				case 2:
++					skb->l4_hash = 0;
++					break;
++				case 3:
++					skb->sw_hash = 0;
++					break;
++				case 4:
++					PACKET_CB(skb)->ds = 3;
++					break;
++				}
++			}
++			if (i == 2 && cases[test].change == 6)
++				skb->hash = 43;
++			if (tail)
++				tail->next = skb;
++			else
++				first = skb;
++			tail = skb;
++			if (i == cases[test].expected)
++				expected_after = skb;
++		}
++		after = first;
++		batch = wg_packet_udp_batch(first, &after);
++		if (!cases[test].expected) {
++			ok = !batch && after == first;
++		} else {
++			ok = batch && after == expected_after;
++			if (batch) {
++				ok &= batch->len == cases[test].expected * cases[test].size &&
++				      batch->hash == 42 && batch->l4_hash && batch->sw_hash &&
++				      skb_shinfo(batch)->gso_type == SKB_GSO_UDP_L4 &&
++				      skb_shinfo(batch)->gso_size == cases[test].size &&
++				      skb_shinfo(batch)->gso_segs == cases[test].expected &&
++				      batch->ip_summed == CHECKSUM_PARTIAL &&
++				      batch->csum_start == skb_headroom(batch) -
++							  sizeof(struct udphdr) &&
++				      batch->csum_offset == offsetof(struct udphdr, check);
++				for (i = 0; ok && i < cases[test].expected; ++i)
++					for (j = 0; j < cases[test].size; ++j)
++						ok &= batch->data[i * cases[test].size + j] ==
++						      i + 1;
++			}
++		}
++		kfree_skb_list(batch ? after : first);
++		kfree_skb(batch);
++		if (!ok) {
++			pr_err("UDP batch self-test %u: FAIL\n", test + 1);
++			success = false;
++		}
++	}
++	if (success)
++		pr_info("UDP batch self-tests (%zu cases): pass\n", ARRAY_SIZE(cases));
++	return success;
++}
++#endif
