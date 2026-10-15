@@ -1,0 +1,17 @@
+{
+  "schema": "wireguard.package-publication/v1",
+  "source_revision": "f6afafe3f382f47262cbef11e8c76a973476e9c2",
+  "release_id": 414225532,
+  "packages": {
+    "kernel": {
+      "asset_id": 645039865,
+      "archive_sha256": "abb560031c711760a03bce18ba57bfbc91c1f68eaaabe0391833d416dfc89e20",
+      "manifest": "sha256:229c04e313d7a90cb8ddf5767a965472a8b53d554e1215c36fbd3f5e95815e43"
+    },
+    "drbd-pkg": {
+      "asset_id": 645039863,
+      "archive_sha256": "d187ceca63d3e4a35fa8c9d45b90718e1fa3032df01ff5f39610e2fcc765fe00",
+      "manifest": "sha256:005b414a6095acfa384ce4faa60ad42246350123b57d20f09d8fcf543c1f1444"
+    }
+  }
+}

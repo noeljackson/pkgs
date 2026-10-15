@@ -137,3 +137,28 @@ virtio-net and all four DRBD modules, and requires one signing key identity
 across the pair. This is not cryptographic module-load or runtime acceptance;
 the exact enforcing Talos boot and lifecycle gates remain mandatory. Source
 publication and new package destinations need their own admitted transaction.
+
+## Publishing the qualified pair
+
+The source-owned `publish-wireguard-candidate.yml` workflow publishes only the
+two final archives recorded in `publication.json`. The separate publication
+commit does not rebuild or change their payload. Their full source revision
+must be an ancestor of the clean workflow checkout. Only a push to this fork's
+`ams-fra-throughput` branch can publish; pull requests and local execution
+cannot. Run `test-publish-candidate.py` for the offline boundary regressions.
+
+The archives transfer through one temporary draft release, with exact release
+and asset IDs, archive checksums and platform manifest digests checked in.
+Both complete OCI layouts, payload hashes and source labels are verified before
+the first registry write. Skopeo preserves the manifests and publishes by
+digest to `ghcr.io/noeljackson/kernel` and `ghcr.io/noeljackson/drbd-pkg`.
+The workflow uses its repository-scoped ephemeral token; it does not export
+an owner's GitHub CLI token or require a new personal credential.
+
+Publication success checks registry manifest bytes but does not prove public
+visibility. Verify anonymous access and repository linkage separately before
+infra consumes either package. Preserve that receipt, then delete only the
+identified transfer draft and its task-owned tag, if present. A later rerun
+after cleanup deliberately refuses the missing transfer instead of rebuilding
+or accepting a substitute. Registry publication does not satisfy the enforcing
+Talos or production acceptance gates.
