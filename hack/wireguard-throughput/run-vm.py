@@ -32,17 +32,74 @@ def overlay(script):
     return output + b"\0" * (-len(output) % 512)
 
 
+def parse_vxlan_results(text, expect_batching):
+    """Require the complete nested-tunnel matrix and observed TX batching."""
+    if expect_batching not in {"enabled", "disabled"}:
+        raise ValueError("VXLAN batching expectation is required")
+    if "VXLAN_FIXTURE_COMPLETE" not in text:
+        raise ValueError("VXLAN fixture did not finish")
+    expected = {
+        f"wg{wire}-vx{vxlan}-{checksum}-tcp{inner}-{direction}"
+        for wire in (4, 6)
+        for vxlan in (4, 6)
+        for checksum in (("udpcsum", "noudpcsum") if vxlan == 4 else ("default6",))
+        for inner in (4, 6)
+        for direction in ("forward", "reverse")
+    }
+    links, rates = {}, {}
+    for chunk in text.split("BEGIN_LINK ")[1:]:
+        case, when = chunk.splitlines()[0].split()
+        key = (case, when)
+        if case not in expected or when not in {"before", "after"} or key in links:
+            raise ValueError("unexpected or duplicate VXLAN link capture")
+        value, _ = json.JSONDecoder().raw_decode(chunk[chunk.index("["):])
+        if len(value) != 1 or value[0]["ifname"] != "wg0":
+            raise ValueError("wrong VXLAN counter interface")
+        links[key] = value[0]["stats64"]["tx"]
+    for chunk in text.split("BEGIN_VXLAN ")[1:]:
+        case = chunk.splitlines()[0].split()[0]
+        if case not in expected or case in rates:
+            raise ValueError("unexpected or duplicate VXLAN transfer")
+        value, _ = json.JSONDecoder().raw_decode(chunk[chunk.index("{"):])
+        if "error" in value:
+            raise ValueError(value["error"])
+        received = value["end"]["sum_received"]
+        if received["bytes"] <= 0 or received["seconds"] < 4.5 or received["bits_per_second"] <= 0:
+            raise ValueError("incomplete VXLAN transfer")
+        rates[case] = received
+    if set(rates) != expected or set(links) != {(case, when) for case in expected for when in ("before", "after")}:
+        raise ValueError("incomplete VXLAN matrix")
+    results = []
+    for case in sorted(expected):
+        before, after = links[(case, "before")], links[(case, "after")]
+        packets, count = after["packets"] - before["packets"], after["bytes"] - before["bytes"]
+        if packets <= 0 or count <= 0:
+            raise ValueError("non-progressing VXLAN counters")
+        mean = count / packets
+        if expect_batching == "enabled" and mean <= 4096:
+            raise ValueError(f"encrypted batching missing: {case} ({mean:.1f} bytes/skb)")
+        if expect_batching == "disabled" and mean >= 2000:
+            raise ValueError(f"baseline already batches: {case} ({mean:.1f} bytes/skb)")
+        results.append(dict(case=case, received=rates[case], wg_tx_packets=packets,
+                            wg_tx_bytes=count, mean_bytes_per_wg_tx_skb=mean))
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=["regression", "namespace", "wire"], required=True)
+    parser.add_argument("--mode", choices=["regression", "namespace", "wire", "vxlan"], required=True)
     parser.add_argument("--kernel", type=Path, required=True)
     parser.add_argument("--peer-kernel", type=Path)
     parser.add_argument("--require-batch-selftest", action="store_true",
                         help="require all eleven batch checks in the main kernel")
+    parser.add_argument("--expect-vxlan-batching", choices=["enabled", "disabled"],
+                        help="required for VXLAN mode; qualify both baseline and candidate")
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
     if bool(args.peer_kernel) != (args.mode == "wire"):
         parser.error("--peer-kernel is required only for wire mode")
+    if bool(args.expect_vxlan_batching) != (args.mode == "vxlan"):
+        parser.error("--expect-vxlan-batching is required only for vxlan mode")
     os.umask(0o077)
     args.out.mkdir(parents=True, exist_ok=True, mode=0o700)
     if args.out.stat().st_uid != os.getuid() or args.out.stat().st_mode & 0o077:
@@ -52,7 +109,8 @@ def main():
     metadata = {"mode": args.mode, "cpus_per_vm": 4 if args.mode == "wire" else 8,
                 "memory_per_vm": "4GiB", "timeout_seconds": 500, "peers": {}}
     metadata.update(runner_sha256=sha(Path(__file__)),
-                    require_batch_selftest=args.require_batch_selftest)
+                    require_batch_selftest=args.require_batch_selftest,
+                    expect_vxlan_batching=args.expect_vxlan_batching)
     procs, handles = [], []
     try:
         with tempfile.TemporaryDirectory(prefix="wg-perf-") as temporary:
@@ -96,7 +154,10 @@ def main():
                 text = Path(metadata["peers"]["client"]["log"]).read_text()
                 if "UDP batch self-tests (11 cases): pass" not in text:
                     raise RuntimeError("the main kernel lacks batch selftest acceptance")
-            if args.mode != "regression":
+            if args.mode == "vxlan":
+                text = Path(metadata["peers"]["client"]["log"]).read_text().replace("\0", "")
+                metadata["measurements"] = parse_vxlan_results(text, args.expect_vxlan_batching)
+            elif args.mode != "regression":
                 text = Path(metadata["peers"]["client"]["log"]).read_text().replace("\0", "")
                 marker = "BEGIN_WIRE " if args.mode == "wire" else "BEGIN_SUSTAINED "
                 rates = []
