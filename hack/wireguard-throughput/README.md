@@ -1,12 +1,12 @@
 # WireGuard batching reproducer
 
-This is source-level verification for patches 0017–0020, using the upstream
+This is source-level verification for patches 0017–0021, using the upstream
 Linux 6.18.48 WireGuard selftest initramfs. It does not qualify a Talos image,
 Cilium configuration, physical NIC, Internet path or production rollout.
 
 Use Linux 6.18.48 from the exact `Pkgfile` checksum. Build the unchanged
 upstream WireGuard QEMU fixture once from baseline source and once with these
-four patches. The upstream Makefile pins and verifies its userspace inputs:
+batching patches. The upstream Makefile pins and verifies its userspace inputs:
 
 ```sh
 make -C "$linux_source/tools/testing/selftests/wireguard/qemu" \
@@ -87,6 +87,43 @@ ciphertext byte total. Generic tunnel netdevice TX packet counters now count
 GSO skbs, and UDP-header overhead is counted per aggregate before segmentation.
 Use physical NIC wire counters for packet conservation; do not interpret a
 lower WireGuard netdevice TX packet count as packet loss.
+
+## VXLAN batching regression
+
+Patch 0021 advertises UDP-tunnel GSO on WireGuard, whose transmit entrypoint
+already fully segments incoming GSO before encryption. Without these feature
+bits, transmit validation splits VXLAN batches before `wg_xmit`, defeating
+encrypted batching. Enable `CONFIG_VXLAN=y` in both test kernels; preserve all
+other configuration and userspace inputs. This fixture needs no Cilium process
+and does not qualify Cilium integration or a physical path.
+
+```sh
+python3 hack/wireguard-throughput/test-vxlan-results.py
+python3 hack/wireguard-throughput/run-vm.py --mode vxlan \
+  --kernel "$baseline_bzimage" --require-batch-selftest \
+  --expect-vxlan-batching disabled --out "$private_results"
+python3 hack/wireguard-throughput/run-vm.py --mode vxlan \
+  --kernel "$candidate_bzimage" --require-batch-selftest \
+  --expect-vxlan-batching enabled --out "$private_results"
+```
+
+The 24-case matrix covers IPv4/IPv6 WireGuard endpoints, IPv4/IPv6 VXLAN
+underlays and TCP payloads, both IPv4 UDP checksum modes, normal IPv6 checksums,
+and forward/reverse traffic. Overlay MTUs are 1320 for IPv4 VXLAN and 1300 for
+IPv6 VXLAN over MTU1370 WireGuard. Private and nested paths must become usable
+within 20 seconds before transfer. This allows the normal handshake retry timer
+after simultaneous cold initiation; it does not waive reachability. Every
+case transfers four TCP streams for five measured seconds after one second
+of warmup. These short transfers establish functionality and batching, not
+sustained production performance.
+
+Before/after sender WireGuard counters must advance in every case. The original
+feature mask produces approximately 1402 ciphertext bytes per TX skb; the
+candidate must exceed 4096 mean bytes per skb. The inverse baseline assertion
+rejects an already-patched control. Incomplete/duplicate cases, wrong interfaces,
+counter regression, missing success and short/empty transfers fail receipt
+qualification. GSO skb counts are not wire-packet counts. Keep the upstream
+regression and paired IPv4/IPv6, policy and CPU-hotplug checks as separate gates.
 
 The production artifact path additionally requires source-owned immutable
 packages, DRBD signed by the matching kernel build, enforcing Talos direct and

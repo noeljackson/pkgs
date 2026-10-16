@@ -1,0 +1,32 @@
+Subject: [PATCH] wireguard: accept UDP tunnel GSO before software segmentation
+
+WireGuard's transmit entrypoint segments GSO skbs before encryption, but
+its feature mask omits UDP tunnel GSO. Transmit validation therefore
+segments VXLAN traffic before wg_xmit, making each resulting packet a
+separate staged/crypto queue submission and defeating encrypted batching.
+
+Advertise both UDP tunnel GSO variants in the existing feature mask.
+wg_xmit still performs complete software segmentation with zero offload
+features before admitting records for encryption. This changes neither
+the wire format nor per-record authentication, checksums or ordering.
+
+The source-level VXLAN fixture covers both WireGuard endpoint families,
+IPv4/IPv6 VXLAN underlays and TCP payloads, IPv4 UDP checksum modes, and
+both directions. Its batching assertion rejects the previous feature mask.
+Physical throughput and the signed Talos/DRBD lifecycle are separate gates.
+
+---
+diff --git a/drivers/net/wireguard/device.c b/drivers/net/wireguard/device.c
+--- a/drivers/net/wireguard/device.c
++++ b/drivers/net/wireguard/device.c
+@@ -276,7 +276,9 @@
+ 	struct wg_device *wg = netdev_priv(dev);
+ 	enum { WG_NETDEV_FEATURES = NETIF_F_HW_CSUM | NETIF_F_RXCSUM |
+ 				    NETIF_F_SG | NETIF_F_GSO |
+-				    NETIF_F_GSO_SOFTWARE | NETIF_F_HIGHDMA };
++				    NETIF_F_GSO_SOFTWARE | NETIF_F_HIGHDMA |
++				    NETIF_F_GSO_UDP_TUNNEL |
++				    NETIF_F_GSO_UDP_TUNNEL_CSUM };
+ 	const int overhead = MESSAGE_MINIMUM_LENGTH + sizeof(struct udphdr) +
+ 			     max(sizeof(struct ipv6hdr), sizeof(struct iphdr));
+ 
