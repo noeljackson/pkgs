@@ -1,17 +1,17 @@
 {
   "schema": "wireguard.package-publication/v1",
-  "source_revision": "cdd772fe6e4696d265303a9e2b0cdb9cd8bea211",
-  "release_id": 415211011,
+  "source_revision": "e676fe67c541d185b3290b8ef93375b0c84896a4",
+  "release_id": 416448621,
   "packages": {
     "kernel": {
-      "asset_id": 648068649,
-      "archive_sha256": "d043075cdcabdd5d29c7c23bf55d26577e319b1c492866afa6b61fd8147fd920",
-      "manifest": "sha256:4ac13f223f1a1600e92c8464fce1317e2d553344c9f8e607340f8d171700664b"
+      "asset_id": 653486068,
+      "archive_sha256": "c3334ae3db6521ace9f68065043bc89af5f0402cae660f0a50aa7cea95a2a10e",
+      "manifest": "sha256:235dfffecca33954c36537dc35c461573596ea26195dd85893d07650d8b2b962"
     },
     "drbd-pkg": {
-      "asset_id": 648068647,
-      "archive_sha256": "d6981cadb61e1e1d815baec54a42719283c595c789686a1cb778cf8573981635",
-      "manifest": "sha256:294edc95a4d74137b18a0def286dff7a509754ed0258d1c9bc6ec6c63d97dd3e"
+      "asset_id": 653486067,
+      "archive_sha256": "7db62c5c599adf49f9fd25269312e380b01645d25e0f280865d6d2ce38df9bbd",
+      "manifest": "sha256:c54c20f622db457ee08befc5b80458d7748694b25357a294b4cb284c4682e8cc"
     }
   }
 }
