@@ -1,0 +1,168 @@
+From: Noel Jackson <n@noeljackson.com>
+Subject: [PATCH] wireguard: coalesce outer UDP batches on the encrypt workers
+
+The ordered per-peer transmit worker is a single serial stage. With outer
+UDP batching it also copied every encrypted packet into a batch buffer and
+released the original packets there. The release runs each owning TCP
+socket's transmit-completion callback, so TCP Small Queues re-homed the next
+inner transmit, with its software GSO segmentation, onto the same CPU. In
+sustained lossless TCP over one peer that CPU saturated at about 4.3 Gbit/s
+while encryption was spread over many CPUs.
+
+Build the batches at the end of the encrypt worker instead, after the whole
+packet list is encrypted, preserving list order. The head packet is already
+linked into the peer's ordered queue and carries the keypair reference, so
+it stays a standalone record and only the packets after it are coalesced.
+The ordered worker now only dequeues and sends. Already coalesced packets
+are never coalesced again. Extend the DEBUG selftest with a list-level case
+(boundaries, byte order, per-batch DS, untouched head, no re-coalescing).
+
+---
+diff --git a/drivers/net/wireguard/selftest/batch.c b/drivers/net/wireguard/selftest/batch.c
+index 59ab9ba..92e3ffc 100644
+--- a/drivers/net/wireguard/selftest/batch.c
++++ b/drivers/net/wireguard/selftest/batch.c
+@@ -1,6 +1,65 @@
+ // SPDX-License-Identifier: GPL-2.0
+ 
+ #ifdef DEBUG
++static bool __init wg_packet_batch_list_selftest(void)
++{
++	/* The head stays standalone: 1 + 31 + 32 + 6, then one shorter record. */
++	static const unsigned int expected[] = { 1, 31, 32, 6, 1 };
++	static const u8 expected_ds[] = { 2, 2, 3, 1, 1 };
++	struct sk_buff *first = NULL, *tail = NULL, *skb, *out;
++	unsigned int i, j, record = 0, count = 0;
++	bool ok = true;
++
++	for (i = 0; i < 71; ++i) {
++		unsigned int size = i == 70 ? 63 : 64;
++
++		skb = alloc_skb(size, GFP_KERNEL);
++		if (!skb) {
++			kfree_skb_list(first);
++			pr_err("UDP batch list self-test allocation: FAIL\n");
++			return false;
++		}
++		memset(skb_put(skb, size), i + 1, size);
++		skb->hash = 42;
++		skb->l4_hash = 1;
++		skb->sw_hash = 1;
++		PACKET_CB(skb)->ds = i < 32 ? 2 : i < 64 ? 3 : 1;
++		if (tail)
++			tail->next = skb;
++		else
++			first = skb;
++		tail = skb;
++	}
++	PACKET_CB(first)->nonce = 0x123456789abcdefULL;
++	PACKET_CB(first)->mtu = 1420;
++	wg_packet_udp_batch_list(first);
++	out = first;
++	for (skb = out; skb; skb = skb->next, ++count) {
++		unsigned int segs = skb_is_gso(skb) ? skb_shinfo(skb)->gso_segs : 1;
++		unsigned int size = skb_is_gso(skb) ? skb_shinfo(skb)->gso_size : skb->len;
++
++		ok &= count < ARRAY_SIZE(expected) && segs == expected[count] &&
++		      PACKET_CB(skb)->ds == expected_ds[count];
++		for (j = 0; ok && j < segs * size; ++j)
++			ok &= skb->data[j] == record + j / size + 1;
++		/* A coalesced packet is never coalesced again. */
++		if (skb_is_gso(skb)) {
++			struct sk_buff *after = skb;
++
++			ok &= !wg_packet_udp_batch(skb, &after) && after == skb;
++		}
++		record += segs;
++	}
++	ok &= count == ARRAY_SIZE(expected) && record == 71;
++	/* The head, and its control block, are untouched. */
++	ok &= out == first && PACKET_CB(out)->nonce == 0x123456789abcdefULL &&
++	      PACKET_CB(out)->mtu == 1420 && PACKET_CB(out)->ds == 2;
++	kfree_skb_list(out);
++	if (!ok)
++		pr_err("UDP batch list self-test: FAIL\n");
++	return ok;
++}
++
+ bool __init wg_packet_batch_selftest(void)
+ {
+ 	static const struct {
+@@ -96,6 +155,7 @@ bool __init wg_packet_batch_selftest(void)
+ 			success = false;
+ 		}
+ 	}
++	success &= wg_packet_batch_list_selftest();
+ 	if (success)
+ 		pr_info("UDP batch self-tests (%zu cases): pass\n", ARRAY_SIZE(cases));
+ 	return success;
+diff --git a/drivers/net/wireguard/send.c b/drivers/net/wireguard/send.c
+index 81f1fb1..789bb73 100644
+--- a/drivers/net/wireguard/send.c
++++ b/drivers/net/wireguard/send.c
+@@ -252,7 +252,7 @@ static struct sk_buff *wg_packet_udp_batch(struct sk_buff *first,
+ 	unsigned int size = first->len, count = 0, len = 0;
+ 	u8 ds = PACKET_CB(first)->ds;
+ 
+-	if (size <= message_data_len(0))
++	if (skb_is_gso(first) || size <= message_data_len(0))
+ 		return NULL;
+ 	for (end = first; end && count < 32; end = end->next) {
+ 		if (end->len != size || PACKET_CB(end)->ds != ds ||
+@@ -297,9 +297,36 @@ static struct sk_buff *wg_packet_udp_batch(struct sk_buff *first,
+ 	return batch;
+ }
+ 
++/*
++ * Coalesce the tail of a complete encrypted list on the encrypt worker, in
++ * list order. The copies and the release of the original packets, which
++ * includes the owning socket's transmit-completion callback, then run on the
++ * parallel encrypt CPUs instead of the single ordered transmit worker. The
++ * head packet is already linked into the peer's ordered queue and carries the
++ * keypair reference, so it is never replaced and stays a standalone record.
++ */
++static void wg_packet_udp_batch_list(struct sk_buff *first)
++{
++	struct sk_buff *prev = first, *skb, *next, *batch;
++
++	for (skb = first->next; skb; skb = next) {
++		u8 ds = PACKET_CB(skb)->ds;
++
++		next = skb->next;
++		batch = wg_packet_udp_batch(skb, &next);
++		if (batch) {
++			PACKET_CB(batch)->ds = ds;
++			skb = batch;
++		}
++		prev->next = skb;
++		prev = skb;
++	}
++	prev->next = NULL;
++}
++
+ static void wg_packet_create_data_done(struct wg_peer *peer, struct sk_buff *first)
+ {
+-	struct sk_buff *skb, *next, *batch;
++	struct sk_buff *skb, *next;
+ 	bool is_keepalive, data_sent = false;
+ 	u8 ds;
+ 
+@@ -308,9 +335,6 @@ static void wg_packet_create_data_done(struct wg_peer *peer, struct sk_buff *fir
+ 	for (skb = first; skb; skb = next) {
+ 		ds = PACKET_CB(skb)->ds;
+ 		next = skb->next;
+-		batch = wg_packet_udp_batch(skb, &next);
+-		if (batch)
+-			skb = batch;
+ 		is_keepalive = skb->len == message_data_len(0);
+ 		if (likely(!wg_socket_send_skb_to_peer(peer, skb, ds) && !is_keepalive))
+ 			data_sent = true;
+@@ -365,6 +389,8 @@ void wg_packet_encrypt_worker(struct work_struct *work)
+ 				break;
+ 			}
+ 		}
++		if (likely(state == PACKET_STATE_CRYPTED))
++			wg_packet_udp_batch_list(first);
+ 		wg_queue_enqueue_per_peer_tx(first, state);
+ 		if (need_resched())
+ 			cond_resched();
