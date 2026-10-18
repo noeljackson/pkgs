@@ -1,0 +1,86 @@
+Subject: [PATCH] wireguard: widen the ordered per-peer receive admission bound
+
+Local alternative prototype; no performance or production qualification.
+The per-peer ordered receive queue holds completed packets behind the oldest
+unfinished one. Its 1024-packet bound (about 3.3 ms at 3 Gbit/s of 1200-byte
+packets) is the same order as measured head stalls, so a stall is converted
+into admission drops. Raise only this bound; transmit, device rings, handshake
+and staged-packet bounds are unchanged.
+
+---
+--- a/drivers/net/wireguard/messages.h
++++ b/drivers/net/wireguard/messages.h
+@@ -50,7 +50,12 @@
+ 	MAX_TIMER_HANDSHAKES = 90 / REKEY_TIMEOUT,
+ 	MAX_QUEUED_INCOMING_HANDSHAKES = 4096, /* TODO: replace this with DQL */
+ 	MAX_STAGED_PACKETS = 128,
+-	MAX_QUEUED_PACKETS = 1024 /* TODO: replace this with DQL */
++	MAX_QUEUED_PACKETS = 1024, /* TODO: replace this with DQL */
++	/* Ordered per-peer receive admission. A completed packet waits here
++	 * behind the oldest unfinished one, so a stall of the head is absorbed
++	 * rather than dropped. Memory is bounded by this many skbs per peer.
++	 */
++	MAX_PEER_RX_QUEUED_PACKETS = 8192
+ };
+ 
+ enum message_type {
+--- a/drivers/net/wireguard/device.h
++++ b/drivers/net/wireguard/device.h
+@@ -35,6 +35,7 @@
+ 	struct sk_buff *head, *tail, *peeked;
+ 	struct { struct sk_buff *next, *prev; } empty; // Match first 2 members of struct sk_buff.
+ 	atomic_t count;
++	unsigned int limit;
+ };
+ 
+ struct wg_device {
+--- a/drivers/net/wireguard/queueing.h
++++ b/drivers/net/wireguard/queueing.h
+@@ -126,7 +126,7 @@
+ 	return cpu;
+ }
+ 
+-void wg_prev_queue_init(struct prev_queue *queue);
++void wg_prev_queue_init(struct prev_queue *queue, unsigned int limit);
+ 
+ /* Multi producer */
+ bool wg_prev_queue_enqueue(struct prev_queue *queue, struct sk_buff *skb);
+--- a/drivers/net/wireguard/queueing.c
++++ b/drivers/net/wireguard/queueing.c
+@@ -50,12 +50,13 @@
+ #define NEXT(skb) ((skb)->prev)
+ #define STUB(queue) ((struct sk_buff *)&queue->empty)
+ 
+-void wg_prev_queue_init(struct prev_queue *queue)
++void wg_prev_queue_init(struct prev_queue *queue, unsigned int limit)
+ {
+ 	NEXT(STUB(queue)) = NULL;
+ 	queue->head = queue->tail = STUB(queue);
+ 	queue->peeked = NULL;
+ 	atomic_set(&queue->count, 0);
++	queue->limit = limit;
+ 	BUILD_BUG_ON(
+ 		offsetof(struct sk_buff, next) != offsetof(struct prev_queue, empty.next) -
+ 							offsetof(struct prev_queue, empty) ||
+@@ -71,7 +72,7 @@
+ 
+ bool wg_prev_queue_enqueue(struct prev_queue *queue, struct sk_buff *skb)
+ {
+-	if (!atomic_add_unless(&queue->count, 1, MAX_QUEUED_PACKETS))
++	if (!atomic_add_unless(&queue->count, 1, queue->limit))
+ 		return false;
+ 	__wg_prev_queue_enqueue(queue, skb);
+ 	return true;
+--- a/drivers/net/wireguard/peer.c
++++ b/drivers/net/wireguard/peer.c
+@@ -47,8 +47,8 @@
+ 	spin_lock_init(&peer->keypairs.keypair_update_lock);
+ 	INIT_WORK(&peer->transmit_handshake_work, wg_packet_handshake_send_worker);
+ 	INIT_WORK(&peer->transmit_packet_work, wg_packet_tx_worker);
+-	wg_prev_queue_init(&peer->tx_queue);
+-	wg_prev_queue_init(&peer->rx_queue);
++	wg_prev_queue_init(&peer->tx_queue, MAX_QUEUED_PACKETS);
++	wg_prev_queue_init(&peer->rx_queue, MAX_PEER_RX_QUEUED_PACKETS);
+ 	rwlock_init(&peer->endpoint_lock);
+ 	kref_init(&peer->refcount);
+ 	skb_queue_head_init(&peer->staged_packet_queue);

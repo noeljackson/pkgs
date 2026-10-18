@@ -19,3 +19,4 @@
 | `0019-wireguard-batch-receive-worker-selection.patch` | Reuse crypto worker selection for bounded RX runs while queuing every entry | Experimental downstream candidate; not deployed | [infra #1430](https://git.noel.sh/noel/infra/issues/1430) |
 
 - `0020-wireguard-test-encrypted-udp-batch-boundaries.patch`: DEBUG-only regression tests for complete records, offload metadata and flow-hash affinity.
+- `0023-wireguard-widen-peer-rx-queue-bound.patch`: EXPERIMENTAL, unselected. Raises only the per-peer ordered receive admission bound (`MAX_PEER_RX_QUEUED_PACKETS` = 8192) via a per-queue `limit`; the transmit peer queue keeps `MAX_QUEUED_PACKETS` and the device encrypt/decrypt rings, handshake and staged-packet bounds are unchanged. Hypothesis: a head-of-line stall of a few milliseconds fills the 1024-packet bound and becomes admission drops. Not performance- or production-qualified ([infra #1430](https://git.noel.sh/noel/infra/issues/1430)).
